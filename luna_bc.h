@@ -70,6 +70,20 @@ extern "C" {
 #define LUNA_BC_KEYCHECK_LEN  8
 #define LUNA_BC_TAG_LEN       16
 
+/* length of the operand keystream; the engine XORs by absolute offset */
+#define LUNA_BC_KS_LEN 512
+
+/* operand formats the custom encoding treats specially; the values mirror
+ * the engine's OPCodeFormat enum, which the tables passed to
+ * luna_bc_build_permutation() already carry */
+#define LUNA_OP_FMT_CONST8            8
+#define LUNA_OP_FMT_CONST            21
+#define LUNA_OP_FMT_ATOM             23
+#define LUNA_OP_FMT_ATOM_U8          24
+#define LUNA_OP_FMT_ATOM_U16         25
+#define LUNA_OP_FMT_ATOM_LABEL_U8    26
+#define LUNA_OP_FMT_ATOM_LABEL_U16   27
+
 /* default and bounds for the PBKDF2 iteration count */
 #define LUNA_BC_KDF_SHIFT_MIN 12
 #define LUNA_BC_KDF_SHIFT_MAX 24
@@ -192,9 +206,24 @@ int luna_bc_parse_header(const uint8_t *buf, size_t len, LunaBCHeader *hdr,
 void luna_bc_build_permutation(LunaBCPerm *p, const uint8_t *key, size_t key_len,
                                const uint8_t *op_size, const uint8_t *op_fmt);
 
-/* Re-key the permutation master for one function ordinal. */
+/* Re-key the permutation master for one function ordinal. Two calls with
+ * (2*i) and (2*i + 1) yield the two parity encodings used by a function. */
 void luna_bc_perm_function_key(uint8_t *out, const uint8_t *perm_master,
                                uint32_t func_index);
+
+/* Keyed byte stream XORed over instruction operands, so operand bytes are
+ * stored encoded and only exist canonically for the instruction being run. */
+void luna_bc_operand_keystream(uint8_t *out, size_t n, const uint8_t *perm_master,
+                               uint32_t func_index);
+
+/* Derive the key that permutes one function's constant pool. */
+void luna_bc_cpool_key(uint8_t *out, const uint8_t *perm_master,
+                       uint32_t func_index, uint32_t cpool_count);
+
+/* Keyed permutation of [0, count), returned as perm and its inverse.
+ * Either output may be NULL. */
+void luna_bc_perm_range(uint32_t *perm, uint32_t *inv, uint32_t count,
+                        const uint8_t *key, size_t key_len);
 
 /* Apply the permutation (or its inverse) over a serialized opcode stream.
  * Returns the number of bytes walked, or -1 if the stream is malformed. */

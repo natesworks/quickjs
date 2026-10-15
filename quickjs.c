@@ -671,17 +671,31 @@ typedef struct JSFunctionBytecode {
     int cpool_count;
     int closure_var_count;
     /*
-     * Luna: non NULL when the bytecode is stored in the container's permuted
-     * opcode encoding. The interpreter never rewrites the stream, it decodes
-     * through these tables, so the bytes in memory stay custom.
-     *   luna_op_map[stored]  = canonical opcode
-     *   luna_dispatch[stored]= handler label (JIT specialized table)
+     * Luna: non NULL when the bytecode is stored in the container's custom
+     * opcode encoding. Nothing canonical is ever materialized for longer than
+     * the instruction currently running: opcodes are permuted (one of two
+     * parity encodings), operand bytes are XORed with a per function
+     * keystream, atom operands index a per function atom table, and constant
+     * pool indices go through a keyed permutation. The interpreter decodes a
+     * single instruction in place, runs it, and immediately re-encodes it.
      *
      * These must stay in front of `debug`: the deserializer sizes the object
      * with offsetof(JSFunctionBytecode, debug) when debug info is stripped.
      */
-    uint8_t *luna_op_map;
-    const void **luna_dispatch;
+    uint8_t *luna_op_map;        /* 512: [(pos & 1) << 8] + stored -> canonical */
+    const void **luna_dispatch;  /* 512 labels, JIT specialized */
+    uint8_t *luna_ks;            /* per function operand keystream */
+    /* One decode slot per active activation: a function can be re-entered
+     * (recursion, async resume) while an instruction is decoded, so each
+     * activation owns the bytes it decoded. */
+    uint32_t *luna_slot_pos;
+    uint8_t (*luna_slot_stored)[16];
+    int luna_slot_count;
+    int luna_slot_cap;
+    uint32_t *luna_atoms;        /* per function atom values */
+    uint32_t luna_atom_count;
+    uint32_t luna_atom_cap;
+    uint32_t luna_cpool_count;   /* size of the permuted constant pool */
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
@@ -1099,29 +1113,82 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags);
 /*
- * Luna instruction fetch: translate one stored opcode and yield the handler to
- * run. Kept as one inlinable helper so the non permuted path stays a single
- * predictable branch.
+ * Luna custom bytecode: per instruction encode/decode.
+ *
+ * A running mod has at most one instruction in canonical form. The fetch
+ * re-encodes the previously decoded instruction, decodes the new one in place
+ * and dispatches it, so a dump of a suspended function shows only custom
+ * bytecode and a dump mid-execution shows a single instruction.
+ *
+ * The dispatch itself stays in the interpreter (the SWITCH macro below) because
+ * the engine's label table is function local: handing it to a helper breaks
+ * link time optimization of the computed goto.
  */
-static const void *luna_emit_dispatch (JSFunctionBytecode * b,
-                                      const void * const * table,
-                                      const uint8_t ** pc,
-                                      int * opcode)
-{
-    int stored = *(*pc)++;
-    int canonical = (b->luna_op_map != NULL) ? b->luna_op_map[stored] : stored;
+static int luna_trace_seq = 0;
 
-    *opcode = canonical;
-    if (unlikely (b->luna_dispatch != NULL))
-        return b->luna_dispatch[stored];
-    return table[canonical];
+static uint32_t luna_decode_insn(JSFunctionBytecode *b, uint32_t pos, uint8_t *stored)
+{
+    const uint8_t *sizes = luna_opcode_sizes();
+    const uint8_t *fmts = luna_opcode_fmts();
+    uint8_t *buf = b->byte_code_buf;
+    int canonical = b->luna_op_map[((pos & 1) << 8) + buf[pos]];
+    uint8_t size = sizes[canonical];
+    uint8_t fmt = fmts[canonical];
+    uint32_t k;
+
+    memcpy(stored, buf + pos + 1, size - 1);
+    for (k = 1; k < size; k++)
+        buf[pos + k] ^= b->luna_ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+    if (getenv ("LUNA_FETCH") && pos < 4)
+        fprintf (stderr, "  [dec] pos=%u size=%u ks=%02x %02x %02x buf=%02x %02x\n",
+                 pos, size, b->luna_ks[1], b->luna_ks[2], b->luna_ks[3],
+                 buf[pos], buf[pos + 1]);
+
+    switch (fmt) {
+    case LUNA_OP_FMT_ATOM:
+    case LUNA_OP_FMT_ATOM_U8:
+    case LUNA_OP_FMT_ATOM_U16:
+    case LUNA_OP_FMT_ATOM_LABEL_U8:
+    case LUNA_OP_FMT_ATOM_LABEL_U16:
+    {
+        uint32_t w = (fmt == LUNA_OP_FMT_ATOM_U8)
+                         ? 1
+                         : ((fmt == LUNA_OP_FMT_ATOM_U16) ? 2 : 4);
+        uint32_t idx = 0;
+        uint32_t atom;
+
+        for (k = 0; k < w; k++)
+            idx |= ((uint32_t)buf[pos + 1 + k]) << (8 * k);
+        atom = (idx < b->luna_atom_count) ? b->luna_atoms[idx] : 0;
+        for (k = 0; k < w; k++)
+            buf[pos + 1 + k] = (uint8_t)(atom >> (8 * k));
+        break;
+    }
+    case LUNA_OP_FMT_CONST:
+    case LUNA_OP_FMT_CONST8:
+        /*
+         * Constant pool indices need no mapping: the pool is stored in the
+         * permuted order and the operand index addresses that order directly,
+         * so b->cpool[index] is the right entry for both sides.
+         */
+        break;
+    default:
+        break;
+    }
+    return size;
 }
 
-static int luna_decode_op (JSFunctionBytecode * b, int stored)
+static void luna_reencode_insn(JSFunctionBytecode *b, uint32_t pos, const uint8_t *stored)
 {
-    if (unlikely (b->luna_op_map != NULL))
-        return b->luna_op_map[stored];
-    return stored;
+    uint8_t *buf = b->byte_code_buf;
+    uint8_t size = luna_opcode_sizes()[b->luna_op_map[((pos & 1) << 8) + buf[pos]]];
+
+    /*
+     * Restoring is a plain copy: `stored` holds the encoded operand bytes
+     * exactly as they were read, so no second XOR is applied (that would
+     * corrupt the stream).
+     */
+    memcpy(buf + pos + 1, stored, size - 1);
 }
 
 static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
@@ -16403,6 +16470,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
     size_t alloca_size;
+    /*
+     * Luna decode state: one slot per activation on the function's decode
+     * stack, because a function may be re-entered recursively or suspended
+     * while an instruction is decoded.
+     */
+    int luna_slot = -1;
 
 /*
  * Luna: the bytecode of a sealed mod stays in its permuted opcode encoding
@@ -16410,8 +16483,35 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  * instead of stock quickjs bytecode. Decoding happens at instruction fetch
  * through a per function table derived from the container key.
  */
+/*
+ * Luna: acquire a decode slot for this activation. The generator/async resume
+ * path jumps straight to restart:, so it acquires its slot there.
+ */
+#define LUNA_ACQUIRE_SLOT()                                                 \
+    do {                                                                     \
+        if (b->luna_op_map != NULL) {                                        \
+            if (b->luna_slot_count == b->luna_slot_cap) {                    \
+                int cap = b->luna_slot_cap ? b->luna_slot_cap * 2 : 8;       \
+                                                                            \
+                b->luna_slot_pos = js_realloc (ctx, b->luna_slot_pos,        \
+                                               cap * sizeof (uint32_t));     \
+                b->luna_slot_stored = js_realloc (ctx, b->luna_slot_stored,  \
+                                                  cap * sizeof (*b->luna_slot_stored)); \
+                if (!b->luna_slot_pos || !b->luna_slot_stored) {             \
+                    b->luna_slot_cap = 0;                                    \
+                    b->luna_slot_count = 0;                                  \
+                    luna_slot = -1;                                          \
+                    goto exception;                                          \
+                }                                                            \
+                b->luna_slot_cap = cap;                                      \
+            }                                                                \
+            luna_slot = b->luna_slot_count++;                                \
+            b->luna_slot_pos[luna_slot] = 0xffffffffu;                       \
+        }                                                                    \
+    } while (0)
+
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      switch (opcode = luna_decode_op (b, *pc++))
+#define SWITCH(pc)      switch (luna_fetch_switch (b, &(pc), luna_slot))
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -16426,7 +16526,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      goto *luna_emit_dispatch (b, dispatch_table, &pc, &opcode);
+#define SWITCH(pc)                                                      \
+    {                                                                  \
+        uint32_t luna_ip = (uint32_t)((pc) - b->byte_code_buf);         \
+        if (unlikely (b->luna_op_map != NULL)) {                        \
+            int luna_byte = (pc)[0];                                    \
+            int luna_slot_i = ((luna_ip & 1) << 8) + luna_byte;         \
+            uint32_t * luna_dp = &b->luna_slot_pos[luna_slot];          \
+            uint8_t * luna_sp = b->luna_slot_stored[luna_slot];         \
+                                                                        \
+            if (*luna_dp != 0xffffffffu)                                \
+                luna_reencode_insn (b, *luna_dp, luna_sp);               \
+            *luna_dp = luna_ip;                                         \
+            luna_decode_insn (b, luna_ip, luna_sp);                     \
+            opcode = b->luna_op_map[luna_slot_i];                       \
+            (pc)++;                                                     \
+            if (getenv ("LUNA_FETCH")) {                                \
+            }                                                           \
+            goto *(b->luna_dispatch != NULL                             \
+                       ? b->luna_dispatch[luna_slot_i]                  \
+                       : dispatch_table[opcode]);                       \
+        }                                                               \
+        opcode = *pc++;                                                 \
+        goto *dispatch_table[opcode];                                   \
+    }
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -16450,6 +16573,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
+            LUNA_ACQUIRE_SLOT ();
             sf->prev_frame = rt->current_stack_frame;
             rt->current_stack_frame = sf;
             if (s->throw_flag)
@@ -16526,18 +16650,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     {
         int o;
 
-        b->luna_dispatch = (const void **)js_malloc(ctx, 256 * sizeof(void *));
+        b->luna_dispatch = (const void **)js_malloc(ctx, 512 * sizeof(void *));
         if (unlikely (!b->luna_dispatch)) {
             b->luna_op_map = NULL;
             goto exception;
         }
-        for (o = 0; o < 256; o++) {
-            int canonical = b->luna_op_map[o];
-
-            b->luna_dispatch[o] = dispatch_table[canonical < 256 ? canonical : 0];
-        }
+        /* both parity encodings, so the fetch is one indexed jump */
+        for (o = 0; o < 512; o++)
+            b->luna_dispatch[o] = dispatch_table[b->luna_op_map[o]];
     }
 #endif
+
+
+    LUNA_ACQUIRE_SLOT ();
 
  restart:
     for(;;) {
@@ -18950,6 +19075,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
+    }
+    if (luna_slot >= 0) {
+        if (b->luna_slot_pos[luna_slot] != 0xffffffffu) {
+            if (getenv ("LUNA_FETCH"))
+                fprintf (stderr, "[exit] b=%p slot=%d pos=%u\n", (void *)b, luna_slot,
+                         b->luna_slot_pos[luna_slot]);
+            luna_reencode_insn (b, b->luna_slot_pos[luna_slot],
+                                b->luna_slot_stored[luna_slot]);
+        }
+        b->luna_slot_pos[luna_slot] = 0xffffffffu;
+        b->luna_slot_count = luna_slot;
     }
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
@@ -33797,11 +33933,30 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
                JS_AtomGetStrRT(rt, buf, sizeof(buf), b->func_name));
     }
 #endif
-    free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, TRUE);
-
     if (b->luna_op_map) {
+        /* the per function atom table owns the references, so the stock atom
+         * walk must not run: its operands are local indices, not atoms */
+        uint32_t i;
+
+        for (i = 0; i < b->luna_atom_count; i++)
+            JS_FreeAtomRT(rt, b->luna_atoms[i]);
+        js_free_rt(rt, b->luna_atoms);
+        b->luna_atoms = NULL;
+        b->luna_atom_count = 0;
+        b->luna_atom_cap = 0;
+        b->luna_cpool_count = 0;
+        js_free_rt(rt, b->luna_ks);
+        b->luna_ks = NULL;
+        js_free_rt(rt, b->luna_slot_pos);
+        js_free_rt(rt, b->luna_slot_stored);
+        b->luna_slot_pos = NULL;
+        b->luna_slot_stored = NULL;
+        b->luna_slot_count = 0;
+        b->luna_slot_cap = 0;
         js_free_rt(rt, b->luna_op_map);
         b->luna_op_map = NULL;
+    } else {
+        free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, TRUE);
     }
     if (b->luna_dispatch) {
         js_free_rt(rt, (void *)b->luna_dispatch);
@@ -35025,6 +35180,12 @@ typedef struct BCWriterState {
     const LunaBCPerm *luna_perm;
     uint8_t luna_perm_master[32];
     uint32_t luna_func_index;
+    /* custom constant pool order for the function being written */
+    uint32_t *luna_cpool_perm;
+    uint32_t *luna_cpool_inv;
+    uint32_t luna_cpool_count;
+    int luna_cpool_written;
+    int luna_atom_relocated;
 } BCWriterState;
 
 #ifdef DUMP_READ_OBJECT
@@ -35234,7 +35395,12 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
         case OP_FMT_atom_u16:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
+            if (s->luna_atom_relocated)
+                break; /* already relocated by the deep encoding */
             atom = get_u32(bc_buf + pos + 1);
+            if (getenv("LUNA_TRACE"))
+                fprintf(stderr, "[luna] s atom pos=%d op=0x%02x size=%d len=%d atom=0x%x\n",
+                        pos, bc_buf[pos], short_opcode_info(bc_buf[pos]).size, len, atom);
             if (bc_atom_to_idx(s, &val, atom))
                 goto fail;
             put_u32(bc_buf + pos + 1, val);
@@ -35440,7 +35606,14 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     int idx, i;
     uint8_t *idx_needs_regexp_bswap = NULL;
     
+    if (getenv("LUNA_TRACE"))
+        fprintf(stderr, "[luna] writer fn#%d: args=%u vars=%u closure=%d debug=%d cpool=%d bclen=%d luna=%d\n",
+                s->luna_func_index, b->arg_count, b->var_count, b->closure_var_count,
+                b->has_debug, b->cpool_count, b->byte_code_len, s->luna_perm != NULL);
     bc_put_u8(s, BC_TAG_FUNCTION_BYTECODE);
+    if (getenv("LUNA_TRACE"))
+        fprintf(stderr, "[luna] writer fn tag at dbuf=%zu (luna=%d)\n",
+                s->dbuf.size, s->luna_perm != NULL);
     flags = idx = 0;
     bc_set_flags(&flags, &idx, b->has_prototype, 1);
     bc_set_flags(&flags, &idx, b->has_simple_parameter_list, 1);
@@ -35502,36 +35675,193 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     
     if (s->luna_perm && b->byte_code_len) {
         uint8_t *perm_buf;
-        uint8_t func_key[32];
-        LunaBCPerm perm;
+        if (getenv("LUNA_TRACE")) {
+            uint32_t z;
 
-        /* every function is re-keyed with its own ordinal, so the instruction
-         * encoding differs from function to function */
-        luna_bc_perm_function_key(func_key, s->luna_perm_master, s->luna_func_index++);
-        luna_bc_build_permutation(&perm, func_key, sizeof(func_key),
+            fprintf(stderr, "[luna] writer fn: bc_len=%d cpool=%d dbuf=%zu bytes:",
+                    b->byte_code_len, b->cpool_count, s->dbuf.size);
+            for (z = 0; z < (uint32_t)b->byte_code_len && z < 40; z++)
+                fprintf(stderr, " %02x", b->byte_code_buf[z]);
+            fprintf(stderr, "\n");
+        }
+        uint8_t func_key[32], ks[LUNA_BC_KS_LEN];
+        uint8_t cpool_key[32];
+        LunaBCPerm perm_even, perm_odd;
+        const uint8_t *sizes, *fmts;
+        uint32_t func_index = s->luna_func_index++;
+        uint32_t cpool_count = (uint32_t)b->cpool_count;
+        uint32_t *cpool_perm = NULL, *cpool_inv = NULL;
+
+        /*
+         * Deep encoding, all of it keyed per function:
+         *   - two opcode permutations, selected by instruction offset parity
+         *   - every operand byte XORed with a per function keystream
+         *   - atom operands become indices into the per function atom table
+         *     built on load
+         *   - constant pool indices go through a keyed permutation, and the
+         *     pool itself is written in that permuted order
+         * Nothing canonical survives on disk; the engine decodes one
+         * instruction at a time while running.
+         */
+        luna_bc_perm_function_key(func_key, s->luna_perm_master, func_index * 2);
+        luna_bc_build_permutation(&perm_even, func_key, sizeof(func_key),
                                   luna_opcode_sizes(), luna_opcode_fmts());
-        memset(func_key, 0, sizeof(func_key));
+        luna_bc_perm_function_key(func_key, s->luna_perm_master, func_index * 2 + 1);
+        luna_bc_build_permutation(&perm_odd, func_key, sizeof(func_key),
+                                  luna_opcode_sizes(), luna_opcode_fmts());
+        luna_bc_wipe(func_key, sizeof(func_key));
+        luna_bc_operand_keystream(ks, sizeof(ks), s->luna_perm_master, func_index);
+        if (getenv("LUNA_TRACE"))
+            fprintf(stderr, "[luna] w ks[%u]=%02x %02x %02x %02x\n", func_index,
+                    ks[0], ks[1], ks[2], ks[3]);
+
+        sizes = luna_opcode_sizes();
+        fmts = luna_opcode_fmts();
+
+        if (cpool_count > 0) {
+            cpool_perm = (uint32_t *)js_malloc(s->ctx, cpool_count * sizeof(uint32_t));
+            cpool_inv = (uint32_t *)js_malloc(s->ctx, cpool_count * sizeof(uint32_t));
+            if (!cpool_perm || !cpool_inv) {
+                js_free(s->ctx, cpool_perm);
+                js_free(s->ctx, cpool_inv);
+                luna_bc_perm_wipe(&perm_even);
+                luna_bc_perm_wipe(&perm_odd);
+                luna_bc_wipe(ks, sizeof(ks));
+                goto fail;
+            }
+            luna_bc_cpool_key(cpool_key, s->luna_perm_master, func_index,
+                              cpool_count);
+            luna_bc_perm_range(cpool_perm, cpool_inv, cpool_count, cpool_key,
+                               sizeof(cpool_key));
+            luna_bc_wipe(cpool_key, sizeof(cpool_key));
+        }
 
         perm_buf = js_malloc(s->ctx, b->byte_code_len);
         if (!perm_buf) {
-            luna_bc_perm_wipe(&perm);
+            js_free(s->ctx, cpool_perm);
+            js_free(s->ctx, cpool_inv);
+            luna_bc_perm_wipe(&perm_even);
+            luna_bc_perm_wipe(&perm_odd);
+            luna_bc_wipe(ks, sizeof(ks));
             goto fail;
         }
         memcpy(perm_buf, b->byte_code_buf, b->byte_code_len);
-        if (luna_bc_permute_stream(perm_buf, (size_t)b->byte_code_len, &perm,
-                                   0, luna_opcode_sizes()) < 0) {
-            js_free(s->ctx, perm_buf);
-            luna_bc_perm_wipe(&perm);
-            goto fail;
+        {
+            size_t pos = 0, len = (size_t)b->byte_code_len;
+
+            while (pos < len) {
+                uint8_t op = perm_buf[pos];
+                uint8_t size = sizes[op];
+                uint8_t fmt;
+                uint32_t k;
+
+                perm_buf[pos] = (pos & 1) ? perm_odd.perm[op] : perm_even.perm[op];
+                if (!size)
+                    break;
+                fmt = fmts[op];
+                if (fmt == LUNA_OP_FMT_ATOM || fmt == LUNA_OP_FMT_ATOM_U8 ||
+                    fmt == LUNA_OP_FMT_ATOM_U16 || fmt == LUNA_OP_FMT_ATOM_LABEL_U8 ||
+                    fmt == LUNA_OP_FMT_ATOM_LABEL_U16)
+                {
+                    /*
+                     * The atom operand is a raw JSAtom here. Relocate it to a
+                     * payload table index exactly like the stock serializer,
+                     * then encode it; the remaining operand bytes of the same
+                     * instruction still get the blanket XOR below.
+                     */
+                    uint32_t w = (fmt == LUNA_OP_FMT_ATOM_U8)
+                                     ? 1
+                                     : ((fmt == LUNA_OP_FMT_ATOM_U16) ? 2 : 4);
+                    JSAtom atom;
+                    uint32_t val;
+
+                    for (k = 0, atom = 0; k < w; k++)
+                        atom |= ((uint32_t)perm_buf[pos + 1 + k]) << (8 * k);
+                    if (getenv("LUNA_TRACE"))
+                        fprintf(stderr, "[luna] w atom pos=%zu op=0x%02x fmt=%u atom=0x%x\n",
+                                pos, op, fmt, atom);
+                    if (bc_atom_to_idx (s, &val, atom) < 0)
+                        goto fail;
+                    for (k = 0; k < w; k++)
+                        perm_buf[pos + 1 + k] =
+                            (uint8_t)((val >> (8 * k)) ^
+                                      ks[(pos + 1 + k) & (LUNA_BC_KS_LEN - 1)]);
+                    for (k = 1; k < size; k++) {
+                        uint32_t off = pos + k;
+
+                        if (k > w)
+                            perm_buf[off] ^= ks[off & (LUNA_BC_KS_LEN - 1)];
+                    }
+                    s->luna_atom_relocated = 1;
+                }
+                else
+                {
+                    for (k = 1; k < size; k++)
+                        perm_buf[pos + k] ^= ks[(pos + k) & (LUNA_BC_KS_LEN - 1)];
+                }
+                if (fmt == LUNA_OP_FMT_CONST || fmt == LUNA_OP_FMT_CONST8) {
+                    /*
+                     * The operand bytes were just XORed, so undo that to read
+                     * the canonical constant index, permute it, and store it
+                     * encoded again. The decoder mirrors this: it un-encodes,
+                     * maps back through the inverse, and leaves the canonical
+                     * index behind for the instruction that is running.
+                     */
+                    uint32_t width = (fmt == LUNA_OP_FMT_CONST8) ? 1 : 4;
+                    uint32_t idx = 0;
+                    uint32_t kk;
+
+                    for (kk = 0; kk < width; kk++) {
+                        uint32_t off = pos + 1 + kk;
+
+                        idx |= ((uint32_t)(perm_buf[off] ^
+                                           ks[off & (LUNA_BC_KS_LEN - 1)]))
+                               << (8 * kk);
+                    }
+                    idx = (idx < cpool_count) ? cpool_perm[idx] : idx;
+                    for (kk = 0; kk < width; kk++) {
+                        uint32_t off = pos + 1 + kk;
+
+                        perm_buf[off] = (uint8_t)((idx >> (8 * kk)) ^
+                                                  ks[off & (LUNA_BC_KS_LEN - 1)]);
+                    }
+                }
+                pos += size;
+            }
+        }
+
+        if (getenv("LUNA_TRACE")) {
+            uint32_t z;
+
+            fprintf(stderr, "[luna] w ks=%02x %02x %02x encoded:",
+                    ks[1], ks[2], ks[3]);
+            for (z = 0; z < (uint32_t)b->byte_code_len && z < 40; z++)
+                fprintf(stderr, " %02x", perm_buf[z]);
+            fprintf(stderr, "\n");
         }
         if (JS_WriteFunctionBytecode(s, perm_buf, b->byte_code_len)) {
             js_free(s->ctx, perm_buf);
-            luna_bc_perm_wipe(&perm);
+            js_free(s->ctx, cpool_perm);
+            js_free(s->ctx, cpool_inv);
+            luna_bc_perm_wipe(&perm_even);
+            luna_bc_perm_wipe(&perm_odd);
+            luna_bc_wipe(ks, sizeof(ks));
             goto fail;
         }
         js_free(s->ctx, perm_buf);
-        luna_bc_perm_wipe(&perm);
-    } else {
+        luna_bc_perm_wipe(&perm_even);
+        luna_bc_perm_wipe(&perm_odd);
+        luna_bc_wipe(ks, sizeof(ks));
+
+        /* the constant pool travels in permuted order; the flags telling the
+         * caller that the deep encoding consumed the pool are dropped by the
+         * plain path below */
+        s->luna_cpool_written = 1;
+        s->luna_atom_relocated = 0;
+        s->luna_cpool_perm = cpool_perm;
+        s->luna_cpool_inv = cpool_inv;
+        s->luna_cpool_count = cpool_count;
+    } else if (1) {
         if (JS_WriteFunctionBytecode(s, b->byte_code_buf, b->byte_code_len))
             goto fail;
     }
@@ -35589,12 +35919,41 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         }
 
         js_free(s->ctx, idx_needs_regexp_bswap);
-    } else {
+    } else if (!s->luna_cpool_written) {
  no_bswap_needed:
         for(i = 0; i < b->cpool_count; i++) {
             if (JS_WriteObjectRec(s, b->cpool[i]))
                 goto fail;
         }
+    }
+
+    if (s->luna_cpool_written) {
+        /*
+         * Custom constant pool order. The nested function writes that happen
+         * inside this loop use the same writer state, so the pool description
+         * is detached from it first: otherwise a nested entry would clobber
+         * the count and truncate the loop.
+         */
+        uint32_t i, count = s->luna_cpool_count;
+        uint32_t *perm = s->luna_cpool_perm, *inv = s->luna_cpool_inv;
+
+        s->luna_cpool_count = 0;
+        s->luna_cpool_perm = NULL;
+        s->luna_cpool_inv = NULL;
+        s->luna_cpool_written = 0;
+        s->luna_atom_relocated = 0;
+
+        for (i = 0; i < count; i++) {
+            uint32_t src = inv[i];
+
+            if (JS_WriteObjectRec(s, b->cpool[src])) {
+                js_free(s->ctx, perm);
+                js_free(s->ctx, inv);
+                goto fail;
+            }
+        }
+        js_free(s->ctx, perm);
+        js_free(s->ctx, inv);
     }
 
     return 0;
@@ -35933,6 +36292,18 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
     bc_put_u8(s, version);
 
     bc_put_leb128(s, s->idx_to_atom_count);
+    if (getenv("LUNA_TRACE")) {
+        int z;
+
+        fprintf(stderr, "[luna] writer atoms (%d):", s->idx_to_atom_count);
+        for (z = 0; z < s->idx_to_atom_count; z++) {
+            char buf[64];
+
+            JS_AtomGetStrRT(rt, buf, sizeof(buf), s->idx_to_atom[z]);
+            fprintf(stderr, " [%d]=%s", z, buf);
+        }
+        fprintf(stderr, "\n");
+    }
     for(i = 0; i < s->idx_to_atom_count; i++) {
         JSAtomStruct *p = rt->atom_array[s->idx_to_atom[i]];
         JS_WriteString(s, p);
@@ -36073,6 +36444,9 @@ static int bc_read_error_end(BCReaderState *s)
 {
     if (!s->error_state) {
         JS_ThrowSyntaxError(s->ctx, "read after the end of the buffer");
+        fprintf(stderr, "[luna] reader overrun at %u of %u\n",
+                (unsigned int)(s->ptr - s->buf_start),
+                (unsigned int)(s->buf_end - s->buf_start));
     }
     return s->error_state = -1;
 }
@@ -36265,32 +36639,173 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
             return -1;
         if (s->luna_unperm && bc_len) {
             uint8_t func_key[32];
-            LunaBCPerm perm;
+            LunaBCPerm perm_even, perm_odd;
+            uint32_t func_index = s->luna_func_index++;
+            uint32_t i;
 
-            luna_bc_perm_function_key(func_key, s->luna_perm_master, s->luna_func_index++);
-            luna_bc_build_permutation(&perm, func_key, sizeof(func_key),
+            /*
+             * The stream stays in its custom encoding; only the decode side is
+             * built here. Two opcode permutations (one per instruction offset
+             * parity), the operand keystream, the per function atom table and
+             * the constant pool permutation are all derived per function.
+             */
+            luna_bc_perm_function_key(func_key, s->luna_perm_master, func_index * 2);
+            luna_bc_build_permutation(&perm_even, func_key, sizeof(func_key),
+                                      luna_opcode_sizes(), luna_opcode_fmts());
+            luna_bc_perm_function_key(func_key, s->luna_perm_master, func_index * 2 + 1);
+            luna_bc_build_permutation(&perm_odd, func_key, sizeof(func_key),
                                       luna_opcode_sizes(), luna_opcode_fmts());
             luna_bc_wipe(func_key, sizeof(func_key));
-            /*
-             * The stream stays permuted: only the decode tables are built.
-             * luna_op_map maps stored -> canonical for the switch build,
-             * luna_dispatch jumps straight to the canonical handler so the
-             * permuted form costs no more than the plain one.
-             */
-            b->luna_op_map = (uint8_t *)js_malloc(s->ctx, 256);
+
+            b->luna_op_map = (uint8_t *)js_malloc(s->ctx, 512);
             if (!b->luna_op_map) {
-                luna_bc_perm_wipe(&perm);
+                luna_bc_perm_wipe(&perm_even);
+                luna_bc_perm_wipe(&perm_odd);
                 bc_read_error_end(s);
                 return -1;
             }
-            memcpy(b->luna_op_map, perm.unperm, 256);
-            luna_bc_perm_wipe(&perm);
+            memcpy(b->luna_op_map, perm_even.unperm, 256);
+            memcpy(b->luna_op_map + 256, perm_odd.unperm, 256);
+            luna_bc_perm_wipe(&perm_even);
+            luna_bc_perm_wipe(&perm_odd);
+
+            b->luna_ks = (uint8_t *)js_malloc(s->ctx, LUNA_BC_KS_LEN);
+            if (!b->luna_ks) {
+                bc_read_error_end(s);
+                return -1;
+            }
+            luna_bc_operand_keystream(b->luna_ks, LUNA_BC_KS_LEN,
+                                      s->luna_perm_master, func_index);
+            if (getenv("LUNA_TRACE"))
+                fprintf(stderr, "[luna] r ks=%02x %02x %02x func_index=%u\n",
+                        b->luna_ks[1], b->luna_ks[2], b->luna_ks[3], func_index);
+
+            b->luna_cpool_count = (uint32_t)b->cpool_count;
+
+            /*
+             * Atom operands carry an index into a per function atom table. The
+             * payload's global table is consulted once here and the operand is
+             * rewritten to the local index, so no atom index in the stream ever
+             * refers to the shared table again.
+             */
+            if (bc_len) {
+                const uint8_t *sizes = luna_opcode_sizes();
+                const uint8_t *fmts = luna_opcode_fmts();
+                uint32_t pos = 0;
+
+                while (pos < (uint32_t)bc_len) {
+                    int canonical = b->luna_op_map[((pos & 1) << 8) + bc_buf[pos]];
+                    uint8_t size = sizes[canonical];
+                    uint8_t fmt = fmts[canonical];
+                    uint32_t k;
+
+                    if (!size)
+                        break;
+                    if (fmt == LUNA_OP_FMT_ATOM || fmt == LUNA_OP_FMT_ATOM_U8 ||
+                        fmt == LUNA_OP_FMT_ATOM_U16 || fmt == LUNA_OP_FMT_ATOM_LABEL_U8 ||
+                        fmt == LUNA_OP_FMT_ATOM_LABEL_U16)
+                    {
+                        uint32_t w = (fmt == LUNA_OP_FMT_ATOM_U8)
+                                         ? 1
+                                         : ((fmt == LUNA_OP_FMT_ATOM_U16) ? 2 : 4);
+                        uint32_t enc = 0;
+                        uint32_t local_idx = 0;
+                        int found = 0;
+                        JSAtom atom;
+
+                        /* XOR decode just the atom part of the operand */
+                        for (k = 0; k < w; k++)
+                            enc |= ((uint32_t)bc_buf[pos + 1 + k] ^
+                                    b->luna_ks[(pos + 1 + k) & (LUNA_BC_KS_LEN - 1)])
+                                   << (8 * k);
+
+                        /* resolve exactly like the stock fixup walk: builtin
+                         * atoms are their own value, tagged ints too, and the
+                         * rest index the payload atom table past first_atom */
+                        if (__JS_AtomIsTaggedInt (enc) || enc < s->first_atom) {
+                            atom = enc;
+                        } else {
+                            uint32_t table_idx = enc - s->first_atom;
+
+                            if (table_idx >= s->idx_to_atom_count) {
+                                fprintf(stderr, "[luna] bad atom idx enc=0x%x first=0x%x count=%u pos=%u fmt=%u size=%u op=0x%02x\n",
+                                        enc, s->first_atom, s->idx_to_atom_count, pos, fmt, size, bc_buf[pos]);
+                                JS_ThrowSyntaxError (s->ctx, "invalid atom index");
+                                return s->error_state = -1;
+                            }
+                            atom = s->idx_to_atom[table_idx];
+                        }
+
+                        for (i = 0; i < b->luna_atom_count; i++) {
+                            if (b->luna_atoms[i] == atom) {
+                                local_idx = i;
+                                found = 1;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            uint32_t *grown;
+
+                            if (b->luna_atom_count == b->luna_atom_cap) {
+                                uint32_t cap = b->luna_atom_cap ? b->luna_atom_cap * 2 : 8;
+
+                                grown = (uint32_t *)js_realloc(
+                                    s->ctx, b->luna_atoms, cap * sizeof(uint32_t));
+                                if (!grown)
+                                    return -1;
+                                b->luna_atoms = grown;
+                                b->luna_atom_cap = cap;
+                            }
+                            local_idx = b->luna_atom_count++;
+                            b->luna_atoms[local_idx] = atom;
+                            JS_DupAtom(s->ctx, atom);
+                        }
+                        /* write the local index back, in encoded form */
+                        for (k = 0; k < w; k++)
+                            bc_buf[pos + 1 + k] =
+                                (uint8_t)((local_idx >> (8 * k)) ^
+                                          b->luna_ks[(pos + 1 + k) &
+                                                     (LUNA_BC_KS_LEN - 1)]);
+                    }
+                    pos += size;
+                }
+            }
         }
     }
     b->byte_code_buf = bc_buf;
+    if (s->luna_unperm && getenv("LUNA_TRACE")) {
+        uint32_t z;
+        uint8_t dbg[256];
+
+        memcpy(dbg, bc_buf, bc_len < 256 ? bc_len : 256);
+        {
+            /* decode the payload side: XOR operands and map constants back */
+            uint32_t p2 = 0;
+
+            while (p2 < (uint32_t)bc_len) {
+                int canon = b->luna_op_map[((p2 & 1) << 8) + dbg[p2]];
+                uint8_t size2 = luna_opcode_sizes()[canon];
+                uint32_t k2;
+
+                if (!size2)
+                    break;
+                for (k2 = 1; k2 < size2; k2++)
+                    dbg[p2 + k2] ^= b->luna_ks[(p2 + k2) & (LUNA_BC_KS_LEN - 1)];
+                p2 += size2;
+            }
+        }
+        fprintf(stderr, "[luna] r decoded len=%d:", bc_len);
+        for (z = 0; z < (uint32_t)bc_len && z < 40; z++)
+            fprintf(stderr, " %02x", dbg[z]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[luna] r stored  len=%d:", bc_len);
+        for (z = 0; z < (uint32_t)bc_len && z < 40; z++)
+            fprintf(stderr, " %02x", bc_buf[z]);
+        fprintf(stderr, "\n");
+    }
 
     pos = 0;
-    while (pos < bc_len) {
+    while (pos < bc_len && !s->luna_unperm) {
         op = bc_buf[pos];
         len = short_opcode_info(op).size;
         switch(short_opcode_info(op).fmt) {
@@ -36551,6 +37066,10 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             
     memcpy(b, &bc, offsetof(JSFunctionBytecode, debug));
     b->header.ref_count = 1;
+    if (s->luna_unperm && getenv("LUNA_TRACE"))
+        fprintf(stderr, "[luna] reader fn: args=%u vars=%u defined=%u stack=%u closure=%d cpool=%d debug=%d local=%d\n",
+                b->arg_count, b->var_count, b->defined_arg_count, b->stack_size,
+                b->closure_var_count, b->cpool_count, b->has_debug, local_count);
     if (local_count != 0) {
         b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
     }
@@ -36675,6 +37194,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
     JSAtom module_name;
     int i;
     uint8_t v8;
+
     
     if (bc_get_atom(s, &module_name))
         goto fail;
@@ -37153,6 +37673,18 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
         if (s->is_rom_data && (atom != (i + s->first_atom)))
             s->is_rom_data = FALSE; /* atoms must be relocated */
     }
+    if (getenv("LUNA_TRACE")) {
+        int z;
+
+        fprintf(stderr, "[luna] reader atoms (%d):", s->idx_to_atom_count);
+        for (z = 0; z < s->idx_to_atom_count; z++) {
+            const char * str = JS_AtomToCString(s->ctx, s->idx_to_atom[z]);
+
+            fprintf(stderr, " [%d]=%s", z, str ? str : "(null)");
+            JS_FreeCString(s->ctx, str);
+        }
+        fprintf(stderr, "\n");
+    }
     bc_read_trace(s, "}\n");
     return 0;
 }
@@ -37168,6 +37700,21 @@ static void bc_reader_free(BCReaderState *s)
     }
     js_free(s->ctx, s->objects);
 }
+
+#ifdef LUNA_GC_DEBUG
+/* Test helper: number of gc objects still alive. */
+void luna_gc_count(JSRuntime * rt, int * out);
+void luna_gc_count(JSRuntime * rt, int * out)
+{
+    struct list_head *el;
+    int n = 0;
+
+    list_for_each(el, &rt->gc_obj_list) {
+        n++;
+    }
+    *out = n;
+}
+#endif
 
 uint8_t *JS_WriteObjectLuna(JSContext *ctx, size_t *psize, JSValueConst obj, int flags,
                             const LunaAntiModData *am, uint32_t kdf_shift, int luna_flags)
@@ -37209,6 +37756,12 @@ uint8_t *JS_WriteObjectLuna(JSContext *ctx, size_t *psize, JSValueConst obj, int
         s->first_atom = 1;
     if (permuted) {
         luna_bc_perm_key(dk, s->luna_perm_master);
+        if (getenv("LUNA_TRACE")) {
+            int z;
+            fprintf(stderr, "[luna] r%d master:", ++luna_trace_seq);
+            for (z = 0; z < 8; z++) fprintf(stderr, " %02x", s->luna_perm_master[z]);
+            fprintf(stderr, "\n");
+        }
         s->luna_func_index = 0;
         s->luna_perm = &perm;
     } else {
@@ -37296,6 +37849,12 @@ JSValue JS_ReadObjectLuna(JSContext *ctx, const uint8_t *buf, size_t buf_len, in
         s->first_atom = 1;
     if (permuted) {
         luna_bc_perm_key(dk, s->luna_perm_master);
+        if (getenv("LUNA_TRACE")) {
+            int z;
+            fprintf(stderr, "[luna] w%d master:", ++luna_trace_seq);
+            for (z = 0; z < 8; z++) fprintf(stderr, " %02x", s->luna_perm_master[z]);
+            fprintf(stderr, "\n");
+        }
         s->luna_func_index = 0;
         s->luna_unperm = &perm;
     } else {

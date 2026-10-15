@@ -19,13 +19,14 @@ $CC -O2 -g -Wall -o "$BUILD/luna_bc_test" luna_bc_test.c luna_bc.c -lm
 
 echo "== engine round trip (compile, seal, decrypt, execute) =="
 $CC -O2 -g -Wall -o "$BUILD/luna_engine_test" luna_engine_test.c quickjs.c \
-    libregexp.c libunicode.c cutils.c libbf.c luna_bc.c \
+    libregexp.c libunicode.c cutils.c libbf.c quickjs-libc.c luna_bc.c \
     -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
 "$BUILD/luna_engine_test"
 
 echo "== mod loader tests (discovery, deps, cross mod imports) =="
-$CC -O2 -g -Wall -o "$BUILD/luna_mods_test" luna_mods_test.c luna_mods.c quickjs.c \
-    libregexp.c libunicode.c cutils.c libbf.c quickjs-libc.c luna_bc.c \
+$CC -O2 -g -Wall -o "$BUILD/luna_mods_test" -DLUNA_GC_DEBUG \
+    luna_mods_test.c luna_mods.c quickjs.c libregexp.c libunicode.c cutils.c \
+    libbf.c quickjs-libc.c luna_bc.c \
     -DCONFIG_VERSION="\"test\"" -DCONFIG_BIGNUM -D_GNU_SOURCE -lm -ldl -lpthread
 LUNA_MOD_PATHS="$BUILD/mods" "$BUILD/luna_mods_test"
 

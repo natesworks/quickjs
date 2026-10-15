@@ -359,8 +359,25 @@ int main(void)
         luna_mods_destroy(m2);
     }
 
-    luna_mods_free_info(info, info_count);
-    luna_mods_destroy(mods);
+    /*
+     * Leak check: with the loader gone every sealed function must have
+     * released its bytecode, atom table and keystream, so only the context's
+     * own intrinsic objects may still be alive.
+     */
+    {
+        void luna_gc_count(JSRuntime * rt, int * out);
+        int remaining = -1, baseline = -1;
+
+        luna_gc_count(rt, &baseline);
+        luna_mods_free_info(info, info_count);
+        luna_mods_destroy(mods);
+        luna_gc_count(rt, &remaining);
+        check(remaining == baseline, "no module objects leak after unload");
+        if (remaining != baseline)
+            fprintf(stderr, "  baseline=%d after=%d\n", baseline, remaining);
+        mods = NULL;
+    }
+
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 

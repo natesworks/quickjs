@@ -20,6 +20,7 @@
  *   entrypoint    bytecode file, defaults to "main.luna"
  */
 #include "luna_mods.h"
+#include "quickjs.h"
 
 #include <dirent.h>
 #include <errno.h>

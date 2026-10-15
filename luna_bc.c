@@ -781,31 +781,6 @@ void luna_bc_perm_key(const uint8_t *dk, uint8_t *out)
     }
 }
 
-void luna_bc_perm_function_key(uint8_t *out, const uint8_t *perm_master,
-                               uint32_t func_index)
-{
-    LunaBCSha256 c;
-    uint8_t idx[4];
-
-    idx[0] = (uint8_t)(func_index);
-    idx[1] = (uint8_t)(func_index >> 8);
-    idx[2] = (uint8_t)(func_index >> 16);
-    idx[3] = (uint8_t)(func_index >> 24);
-
-    luna_bc_sha256_init (&c);
-    luna_bc_sha256_update (&c, "luna-perm-func-v1", 17);
-    luna_bc_sha256_update (&c, perm_master, LUNA_BC_KEY_LEN);
-    luna_bc_sha256_update (&c, idx, sizeof (idx));
-    luna_bc_sha256_final (&c, out);
-}
-
-void luna_bc_perm_wipe(LunaBCPerm *p)
-{
-    luna_bc_wipe(p, sizeof(*p));
-}
-
-/* A tiny SHA-256 based stream generator: deterministic on all platforms and
- * without any global state. */
 typedef struct LunaBCRng {
     uint32_t counter;
     uint8_t key[32];
@@ -867,6 +842,145 @@ static uint32_t luna_bc_rng_below(LunaBCRng *r, uint32_t bound)
     }
 }
 
+void luna_bc_perm_function_key(uint8_t *out, const uint8_t *perm_master,
+                               uint32_t func_index)
+{
+    LunaBCSha256 c;
+    uint8_t idx[4];
+
+    idx[0] = (uint8_t)(func_index);
+    idx[1] = (uint8_t)(func_index >> 8);
+    idx[2] = (uint8_t)(func_index >> 16);
+    idx[3] = (uint8_t)(func_index >> 24);
+
+    luna_bc_sha256_init (&c);
+    luna_bc_sha256_update (&c, "luna-perm-func-v1", 17);
+    luna_bc_sha256_update (&c, perm_master, LUNA_BC_KEY_LEN);
+    luna_bc_sha256_update (&c, idx, sizeof (idx));
+    luna_bc_sha256_final (&c, out);
+}
+
+void luna_bc_operand_keystream(uint8_t *out, size_t n, const uint8_t *perm_master,
+                               uint32_t func_index)
+{
+    LunaBCSha256 c;
+    uint8_t idx[4], block[32];
+    size_t done = 0;
+    uint32_t counter = 0;
+
+    idx[0] = (uint8_t)(func_index);
+    idx[1] = (uint8_t)(func_index >> 8);
+    idx[2] = (uint8_t)(func_index >> 16);
+    idx[3] = (uint8_t)(func_index >> 24);
+
+    while (done < n) {
+        uint8_t ctr[4];
+        size_t take;
+
+        ctr[0] = (uint8_t)(counter);
+        ctr[1] = (uint8_t)(counter >> 8);
+        ctr[2] = (uint8_t)(counter >> 16);
+        ctr[3] = (uint8_t)(counter >> 24);
+        counter++;
+
+        luna_bc_sha256_init(&c);
+        luna_bc_sha256_update(&c, "luna-operand-ks-v1", 18);
+        luna_bc_sha256_update(&c, perm_master, LUNA_BC_KEY_LEN);
+        luna_bc_sha256_update(&c, idx, sizeof(idx));
+        luna_bc_sha256_update(&c, ctr, sizeof(ctr));
+        luna_bc_sha256_final(&c, block);
+
+        take = n - done;
+        if (take > sizeof(block))
+            take = sizeof(block);
+        memcpy(out + done, block, take);
+        done += take;
+    }
+    luna_bc_wipe(block, sizeof(block));
+}
+
+void luna_bc_cpool_key(uint8_t *out, const uint8_t *perm_master,
+                       uint32_t func_index, uint32_t cpool_count)
+{
+    LunaBCSha256 c;
+    uint8_t buf[12];
+
+    buf[0] = (uint8_t)(func_index);
+    buf[1] = (uint8_t)(func_index >> 8);
+    buf[2] = (uint8_t)(func_index >> 16);
+    buf[3] = (uint8_t)(func_index >> 24);
+    buf[4] = (uint8_t)(cpool_count);
+    buf[5] = (uint8_t)(cpool_count >> 8);
+    buf[6] = (uint8_t)(cpool_count >> 16);
+    buf[7] = (uint8_t)(cpool_count >> 24);
+    buf[8] = (uint8_t)(cpool_count >> 16);
+    buf[9] = (uint8_t)(cpool_count >> 24);
+    buf[10] = (uint8_t)(cpool_count >> 8);
+    buf[11] = (uint8_t)(cpool_count);
+
+    luna_bc_sha256_init(&c);
+    luna_bc_sha256_update(&c, "luna-cpool-v1", 12);
+    luna_bc_sha256_update(&c, perm_master, LUNA_BC_KEY_LEN);
+    luna_bc_sha256_update(&c, buf, sizeof(buf));
+    luna_bc_sha256_final(&c, out);
+    luna_bc_wipe(buf, sizeof(buf));
+}
+
+void luna_bc_perm_range(uint32_t *perm, uint32_t *inv, uint32_t count,
+                        const uint8_t *key, size_t key_len)
+{
+    LunaBCRng rng;
+    uint32_t i;
+
+    /* both outputs are filled, so the shuffle runs on a local when only one is
+     * wanted */
+    {
+        uint32_t *work = perm;
+        uint32_t stack_buf[64];
+
+        if (!work) {
+            work = (count <= sizeof(stack_buf) / sizeof(stack_buf[0]))
+                       ? stack_buf
+                       : (uint32_t *)malloc(count * sizeof(uint32_t));
+            if (!work)
+                return;
+        }
+        for (i = 0; i != count; i++)
+            work[i] = i;
+        if (count >= 2 && key) {
+            luna_bc_rng_init(&rng, key, key_len);
+            for (i = count - 1; i > 0; i--) {
+                uint32_t j = luna_bc_rng_below(&rng, i + 1);
+                uint32_t t = work[i];
+
+                work[i] = work[j];
+                work[j] = t;
+            }
+            luna_bc_wipe(&rng, sizeof(rng));
+        }
+        if (perm) {
+            if (inv)
+                for (i = 0; i != count; i++)
+                    inv[perm[i]] = i;
+        } else {
+            if (inv)
+                for (i = 0; i != count; i++)
+                    inv[work[i]] = i;
+            if (work != stack_buf)
+                free(work);
+            else
+                luna_bc_wipe(work, sizeof(stack_buf));
+        }
+    }
+}
+
+void luna_bc_perm_wipe(LunaBCPerm *p)
+{
+    luna_bc_wipe(p, sizeof(*p));
+}
+
+/* A tiny SHA-256 based stream generator: deterministic on all platforms and
+ * without any global state. */
 void luna_bc_build_permutation(LunaBCPerm *p, const uint8_t *key, size_t key_len,
                               const uint8_t *op_size, const uint8_t *op_fmt)
 {

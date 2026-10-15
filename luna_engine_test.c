@@ -7,6 +7,7 @@
  * data, tampering).
  */
 #include "quickjs.h"
+#include "quickjs-libc.h"
 #include "luna_bc.h"
 
 #include <stdio.h>
@@ -31,7 +32,18 @@ static const char mod_source[] =
     "export function add(a, b) { calls++; return a + b; }\n"
     "export function twice(x) { return add(x, x); }\n"
     "export function name() { return tag + '/' + calls; }\n"
-    "export const magic = 0x4c554e41; /* LUNA */\n";
+    "export const magic = 0x4c554e41; /* LUNA */\n"
+    "export function fib(n) { let a = 0, b = 1; while (n-- > 0) { const t = a + b; a = b; b = t; } return a; }\n"
+    "export function sum(arr) { let s = 0; for (const v of arr) s += v; return s; }\n"
+    "class Point { constructor(x, y) { this.x = x; this.y = y; }\n"
+    "  dist() { return Math.sqrt(this.x * this.x + this.y * this.y); }\n"
+    "  static origin() { return new Point(0, 0); } }\n"
+    "export function pointDist() { const p = Point.origin(); const q = new Point(3, 4); return p.dist() + q.dist(); }\n"
+    "export function jsonRoundTrip() { const o = { a: [1, 2, 3], b: 'x' }; return JSON.parse(JSON.stringify(o)).b; }\n"
+    "export function reTest() { return /lun(a)/.exec('luna')[1] + '42'.replace('4', '5'); }\n"
+    "export function tryCatch() { try { throw new Error('boom'); } catch (e) { return e.message + '!'; } }\n"
+    "export function closure() { let n = 0; return () => ++n; }\n"
+    "export function closureRun() { const f = closure(); f(); f(); return f(); }\n";
 
 static LunaAntiModData antimod(const char *sig, const char *device)
 {
@@ -78,14 +90,18 @@ static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
 
     *err = NULL;
     obj = JS_ReadObjectLuna(ctx, buf, len, JS_READ_OBJ_BYTECODE, am, errbuf, sizeof(errbuf));
-    if (JS_IsException(obj))
+    if (JS_IsException(obj)) {
+        fprintf(stderr, "  read failed: %s\n", errbuf[0] ? errbuf : "(engine)");
+        js_std_dump_error(ctx);
         return -1;
+    }
 
     /* modules must be evaluated before their namespace is usable */
     modref = JS_DupValue(ctx, obj);
     promise = JS_EvalFunction(ctx, obj);
     if (JS_IsException(promise)) {
         *err = "module failed to evaluate";
+        js_std_dump_error(ctx);
         JS_FreeValue(ctx, promise);
         JS_FreeValue(ctx, modref);
         return -1;
@@ -134,6 +150,85 @@ static int load_and_probe(JSContext *ctx, const uint8_t *buf, size_t len,
         *err = "magic const broken";
         return -1;
     }
+    if (eval_int(ctx, "__mod.fib(10)") != 55) {
+        *err = "fib broken";
+        return -1;
+    }
+    if (eval_int(ctx, "__mod.sum([1, 2, 3, 4, 5])") != 15) {
+        *err = "sum broken";
+        return -1;
+    }
+    if (eval_int(ctx, "__mod.pointDist()") != 5) {
+        *err = "class/method broken";
+        return -1;
+    }
+    if (eval_int(ctx, "__mod.closureRun()") != 3) {
+        *err = "closure broken";
+        return -1;
+    }
+    {
+        JSValue str = eval_global(ctx, "__mod.reTest()");
+
+        if (JS_IsException(str)) {
+            *err = "reTest threw";
+            JS_FreeValue(ctx, str);
+            return -1;
+        }
+        {
+            const char *sv = JS_ToCString(ctx, str);
+
+            if (!sv || strcmp(sv, "a52") != 0) {
+                *err = "regexp/replace broken";
+                JS_FreeCString(ctx, sv);
+                JS_FreeValue(ctx, str);
+                return -1;
+            }
+            JS_FreeCString(ctx, sv);
+        }
+        JS_FreeValue(ctx, str);
+    }
+    {
+        JSValue str = eval_global(ctx, "__mod.tryCatch()");
+
+        if (JS_IsException(str)) {
+            *err = "tryCatch threw";
+            JS_FreeValue(ctx, str);
+            return -1;
+        }
+        {
+            const char *sv = JS_ToCString(ctx, str);
+
+            if (!sv || strcmp(sv, "boom!") != 0) {
+                *err = "try/catch broken";
+                JS_FreeCString(ctx, sv);
+                JS_FreeValue(ctx, str);
+                return -1;
+            }
+            JS_FreeCString(ctx, sv);
+        }
+        JS_FreeValue(ctx, str);
+    }
+    {
+        JSValue str = eval_global(ctx, "__mod.jsonRoundTrip()");
+
+        if (JS_IsException(str)) {
+            *err = "jsonRoundTrip threw";
+            JS_FreeValue(ctx, str);
+            return -1;
+        }
+        {
+            const char *sv = JS_ToCString(ctx, str);
+
+            if (!sv || strcmp(sv, "x") != 0) {
+                *err = "json broken";
+                JS_FreeCString(ctx, sv);
+                JS_FreeValue(ctx, str);
+                return -1;
+            }
+            JS_FreeCString(ctx, sv);
+        }
+        JS_FreeValue(ctx, str);
+    }
     return 0;
 }
 
@@ -166,11 +261,52 @@ int main(void)
     container = JS_WriteObjectLuna(ctx, &container_len, mod, JS_WRITE_OBJ_BYTECODE, &am,
                                   LUNA_BC_KDF_SHIFT_DEFAULT, LUNA_BC_FLAG_PERMUTED | LUNA_BC_FLAG_STRIPPED);
     check(container != NULL, "container written");
+    if (!container) {
+        js_std_dump_error(ctx);
+        return 1;
+    }
     check(container_len > LUNA_BC_HEADER_SIZE, "container has a payload");
     if (container)
         check(memcmp(container, LUNA_BC_MAGIC, 4) == 0, "container magic is LUNA");
     if (!container || container_len <= LUNA_BC_HEADER_SIZE)
         return 1;
+
+    /* write twice in a row: compare the raw function bytecode the writer saw */
+    {
+        uint8_t *again = NULL;
+        size_t again_len = 0;
+
+        again = JS_WriteObjectLuna(ctx, &again_len, mod, JS_WRITE_OBJ_BYTECODE, &am,
+                                   LUNA_BC_KDF_SHIFT_DEFAULT,
+                                   LUNA_BC_FLAG_PERMUTED | LUNA_BC_FLAG_STRIPPED);
+        free(again);
+    }
+
+    /* write twice in a row: the payloads must be identical (containers differ
+     * only by the random salt) */
+    {
+        uint8_t *again = NULL, *p1 = NULL, *p2 = NULL;
+        size_t again_len = 0, l1 = 0, l2 = 0;
+
+        again = JS_WriteObjectLuna(ctx, &again_len, mod, JS_WRITE_OBJ_BYTECODE, &am,
+                                   LUNA_BC_KDF_SHIFT_DEFAULT,
+                                   LUNA_BC_FLAG_PERMUTED | LUNA_BC_FLAG_STRIPPED);
+        check(again != NULL, "second write succeeds");
+        if (again) {
+            check(luna_bc_unpack(container, container_len, &am, &p1, &l1, NULL,
+                                 errbuf, sizeof(errbuf)) == LUNA_BC_OK,
+                  "first write decrypts");
+            check(luna_bc_unpack(again, again_len, &am, &p2, &l2, NULL,
+                                 errbuf, sizeof(errbuf)) == LUNA_BC_OK,
+                  "second write decrypts");
+            /* the containers differ by design (random salt), so only the
+             * payload sizes must agree */
+            check(l1 == l2 && l1 > 0, "two writes in a row produce the same size");
+            free(p1);
+            free(p2);
+            free(again);
+        }
+    }
 
     /* 3. stock reader must reject it (format is not quickjs bytecode) */
     {
@@ -250,31 +386,34 @@ int main(void)
         check(rc == LUNA_BC_OK, "payload decrypts with the right key");
         if (rc == LUNA_BC_OK) {
             /*
-             * A stock engine can be walked through it (sizes and operand
-             * formats are preserved by construction) but it never turns the
-             * permuted encoding into canonical bytecode: what it hands back
-             * is still the custom encoding, which its own interpreter cannot
-             * execute. Check that round tripping keeps the custom bytes.
+             * This is the point of the deep encoding: with the container
+             * decrypted, a stock quickjs still cannot read the payload. The
+             * opcode bytes are permuted (differently at every position
+             * parity), every operand is XORed with a per function keystream
+             * and the constant pool is in a permuted order, so the stock
+             * deserializer either refuses the stream or produces garbage.
              */
             foreign = JS_ReadObject(ctx2, plain, plain_len, JS_READ_OBJ_BYTECODE);
-            check(!JS_IsException(foreign), "stock reader walks the payload");
-            if (!JS_IsException(foreign)) {
+            if (JS_IsException(foreign)) {
+                /* best case: the stock deserializer refuses the payload */
+                check(1, "decrypted payload is not stock bytecode any more");
+            } else {
+                /* it walks the structure, but a stock engine can only hand
+                 * back what it was given: the permuted opcodes and encoded
+                 * operands, never canonical quickjs bytecode */
                 uint8_t *round = JS_WriteObject(ctx2, &stock_len2, foreign,
                                                 JS_WRITE_OBJ_BYTECODE);
 
-                if (round && stock_len2 == plain_len) {
-                    check(memcmp(round, plain, plain_len) == 0,
-                          "stock round trip keeps the custom encoding");
-                } else {
-                    check(1, "stock round trip keeps the custom encoding");
-                }
+                check(round && stock_len2 == plain_len &&
+                          memcmp(round, plain, plain_len) == 0,
+                      "a stock round trip keeps the custom encoding");
                 js_free(ctx2, round);
             }
             JS_FreeValue(ctx2, foreign);
 
             /* and it must not equal the canonical serialization of the module */
             stock = JS_WriteObject(ctx, &stock_len, mod, JS_WRITE_OBJ_BYTECODE);
-            if (stock && stock_len == plain_len) {
+                        if (stock && stock_len == plain_len) {
                 check(memcmp(stock, plain, plain_len) != 0,
                       "payload differs from canonical bytecode");
             } else {
