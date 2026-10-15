@@ -56,6 +56,7 @@
 #include "quickjs.h"
 #include "libregexp.h"
 #include "libbf.h"
+#include "luna_bc.h"
 
 #define OPTIMIZE         1
 #define SHORT_OPCODES    1
@@ -669,6 +670,18 @@ typedef struct JSFunctionBytecode {
     JSValue *cpool; /* constant pool (self pointer) */
     int cpool_count;
     int closure_var_count;
+    /*
+     * Luna: non NULL when the bytecode is stored in the container's permuted
+     * opcode encoding. The interpreter never rewrites the stream, it decodes
+     * through these tables, so the bytes in memory stay custom.
+     *   luna_op_map[stored]  = canonical opcode
+     *   luna_dispatch[stored]= handler label (JIT specialized table)
+     *
+     * These must stay in front of `debug`: the deserializer sizes the object
+     * with offsetof(JSFunctionBytecode, debug) when debug info is stripped.
+     */
+    uint8_t *luna_op_map;
+    const void **luna_dispatch;
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
@@ -1085,6 +1098,32 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags);
+/*
+ * Luna instruction fetch: translate one stored opcode and yield the handler to
+ * run. Kept as one inlinable helper so the non permuted path stays a single
+ * predictable branch.
+ */
+static const void *luna_emit_dispatch (JSFunctionBytecode * b,
+                                      const void * const * table,
+                                      const uint8_t ** pc,
+                                      int * opcode)
+{
+    int stored = *(*pc)++;
+    int canonical = (b->luna_op_map != NULL) ? b->luna_op_map[stored] : stored;
+
+    *opcode = canonical;
+    if (unlikely (b->luna_dispatch != NULL))
+        return b->luna_dispatch[stored];
+    return table[canonical];
+}
+
+static int luna_decode_op (JSFunctionBytecode * b, int stored)
+{
+    if (unlikely (b->luna_op_map != NULL))
+        return b->luna_op_map[stored];
+    return stored;
+}
+
 static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
                                int argc, JSValue *argv, int flags);
@@ -16365,8 +16404,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSVarRef **var_refs;
     size_t alloca_size;
 
+/*
+ * Luna: the bytecode of a sealed mod stays in its permuted opcode encoding
+ * all the way into the interpreter, so dumping memory yields custom bytecode
+ * instead of stock quickjs bytecode. Decoding happens at instruction fetch
+ * through a per function table derived from the container key.
+ */
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      switch (opcode = *pc++)
+#define SWITCH(pc)      switch (opcode = luna_decode_op (b, *pc++))
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -16381,7 +16426,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      goto *dispatch_table[opcode = *pc++];
+#define SWITCH(pc)      goto *luna_emit_dispatch (b, dispatch_table, &pc, &opcode);
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -16469,7 +16514,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
-    
+
+#if DIRECT_DISPATCH
+    /*
+     * Luna JIT: the first execution of a permuted function specializes its
+     * dispatch table, so the permuted encoding costs a single indexed jump
+     * instead of a second lookup through the global table. The bytecode
+     * itself is never rewritten, memory keeps the custom encoding.
+     */
+    if (unlikely (b->luna_op_map != NULL && b->luna_dispatch == NULL))
+    {
+        int o;
+
+        b->luna_dispatch = (const void **)js_malloc(ctx, 256 * sizeof(void *));
+        if (unlikely (!b->luna_dispatch)) {
+            b->luna_op_map = NULL;
+            goto exception;
+        }
+        for (o = 0; o < 256; o++) {
+            int canonical = b->luna_op_map[o];
+
+            b->luna_dispatch[o] = dispatch_table[canonical < 256 ? canonical : 0];
+        }
+    }
+#endif
+
  restart:
     for(;;) {
         int call_argc;
@@ -20325,6 +20394,52 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #else
 #define short_opcode_info(op) opcode_info[op]
 #endif
+
+/* ------------------------------------------------------------------ *
+ * NBS custom bytecode support
+ *
+ * Flat opcode size/format tables mirroring opcode_info, so the bytecode
+ * container codec can validate and permute opcode streams without knowing
+ * about the engine's internal macro layout.
+ * ------------------------------------------------------------------ */
+
+static uint8_t luna_op_size_tab[256];
+static uint8_t luna_op_fmt_tab[256];
+static BOOL luna_op_tab_init;
+
+static void luna_build_opcode_tables(void)
+{
+    int op, total = OP_COUNT + (OP_TEMP_END - OP_TEMP_START);
+
+    if (luna_op_tab_init)
+        return;
+    luna_op_tab_init = TRUE;
+    memset(luna_op_size_tab, 0, sizeof(luna_op_size_tab));
+    memset(luna_op_fmt_tab, 0, sizeof(luna_op_fmt_tab));
+    for (op = 0; op < 256; op++) {
+#if SHORT_OPCODES
+        int idx = (op >= OP_TEMP_START) ? (op + (OP_TEMP_END - OP_TEMP_START)) : op;
+#else
+        int idx = op;
+#endif
+        if (idx < total) {
+            luna_op_size_tab[op] = opcode_info[idx].size;
+            luna_op_fmt_tab[op] = opcode_info[idx].fmt;
+        }
+    }
+}
+
+const uint8_t *luna_opcode_sizes(void)
+{
+    luna_build_opcode_tables();
+    return luna_op_size_tab;
+}
+
+const uint8_t *luna_opcode_fmts(void)
+{
+    luna_build_opcode_tables();
+    return luna_op_fmt_tab;
+}
 
 static __exception int next_token(JSParseState *s);
 
@@ -33684,6 +33799,15 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 #endif
     free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, TRUE);
 
+    if (b->luna_op_map) {
+        js_free_rt(rt, b->luna_op_map);
+        b->luna_op_map = NULL;
+    }
+    if (b->luna_dispatch) {
+        js_free_rt(rt, (void *)b->luna_dispatch);
+        b->luna_dispatch = NULL;
+    }
+
     if (b->vardefs) {
         for(i = 0; i < b->arg_count + b->var_count; i++) {
             JS_FreeAtomRT(rt, b->vardefs[i].var_name);
@@ -34897,6 +35021,10 @@ typedef struct BCWriterState {
     int sab_tab_size;
     /* list of referenced objects (used if allow_reference = TRUE) */
     JSObjectList object_list;
+    /* Luna: canonical -> stored opcode table, NULL for stock serialization */
+    const LunaBCPerm *luna_perm;
+    uint8_t luna_perm_master[32];
+    uint32_t luna_func_index;
 } BCWriterState;
 
 #ifdef DUMP_READ_OBJECT
@@ -35372,8 +35500,41 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_u8(s, flags);
     }
     
-    if (JS_WriteFunctionBytecode(s, b->byte_code_buf, b->byte_code_len))
-        goto fail;
+    if (s->luna_perm && b->byte_code_len) {
+        uint8_t *perm_buf;
+        uint8_t func_key[32];
+        LunaBCPerm perm;
+
+        /* every function is re-keyed with its own ordinal, so the instruction
+         * encoding differs from function to function */
+        luna_bc_perm_function_key(func_key, s->luna_perm_master, s->luna_func_index++);
+        luna_bc_build_permutation(&perm, func_key, sizeof(func_key),
+                                  luna_opcode_sizes(), luna_opcode_fmts());
+        memset(func_key, 0, sizeof(func_key));
+
+        perm_buf = js_malloc(s->ctx, b->byte_code_len);
+        if (!perm_buf) {
+            luna_bc_perm_wipe(&perm);
+            goto fail;
+        }
+        memcpy(perm_buf, b->byte_code_buf, b->byte_code_len);
+        if (luna_bc_permute_stream(perm_buf, (size_t)b->byte_code_len, &perm,
+                                   0, luna_opcode_sizes()) < 0) {
+            js_free(s->ctx, perm_buf);
+            luna_bc_perm_wipe(&perm);
+            goto fail;
+        }
+        if (JS_WriteFunctionBytecode(s, perm_buf, b->byte_code_len)) {
+            js_free(s->ctx, perm_buf);
+            luna_bc_perm_wipe(&perm);
+            goto fail;
+        }
+        js_free(s->ctx, perm_buf);
+        luna_bc_perm_wipe(&perm);
+    } else {
+        if (JS_WriteFunctionBytecode(s, b->byte_code_buf, b->byte_code_len))
+            goto fail;
+    }
     
     if (b->has_debug) {
         bc_put_atom(s, b->debug.filename);
@@ -35862,6 +36023,10 @@ typedef struct BCReaderState {
     JSObject **objects;
     int objects_count;
     int objects_size;
+    /* Luna: stored -> canonical opcode table, NULL for stock deserialization */
+    const LunaBCPerm *luna_unperm;
+    uint8_t luna_perm_master[32];
+    uint32_t luna_func_index;
     
 #ifdef DUMP_READ_OBJECT
     const uint8_t *ptr_last;
@@ -36098,6 +36263,29 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
         bc_buf = (void *)((uint8_t*)b + byte_code_offset);
         if (bc_get_buf(s, bc_buf, bc_len))
             return -1;
+        if (s->luna_unperm && bc_len) {
+            uint8_t func_key[32];
+            LunaBCPerm perm;
+
+            luna_bc_perm_function_key(func_key, s->luna_perm_master, s->luna_func_index++);
+            luna_bc_build_permutation(&perm, func_key, sizeof(func_key),
+                                      luna_opcode_sizes(), luna_opcode_fmts());
+            luna_bc_wipe(func_key, sizeof(func_key));
+            /*
+             * The stream stays permuted: only the decode tables are built.
+             * luna_op_map maps stored -> canonical for the switch build,
+             * luna_dispatch jumps straight to the canonical handler so the
+             * permuted form costs no more than the plain one.
+             */
+            b->luna_op_map = (uint8_t *)js_malloc(s->ctx, 256);
+            if (!b->luna_op_map) {
+                luna_bc_perm_wipe(&perm);
+                bc_read_error_end(s);
+                return -1;
+            }
+            memcpy(b->luna_op_map, perm.unperm, 256);
+            luna_bc_perm_wipe(&perm);
+        }
     }
     b->byte_code_buf = bc_buf;
 
@@ -36979,6 +37167,171 @@ static void bc_reader_free(BCReaderState *s)
         js_free(s->ctx, s->idx_to_atom);
     }
     js_free(s->ctx, s->objects);
+}
+
+uint8_t *JS_WriteObjectLuna(JSContext *ctx, size_t *psize, JSValueConst obj, int flags,
+                            const LunaAntiModData *am, uint32_t kdf_shift, int luna_flags)
+{
+    LunaBCHeader hdr;
+    uint8_t dk[LUNA_BC_DK_LEN];
+    LunaBCPerm perm;
+    int permuted;
+    BCWriterState ss, *s = &ss;
+    uint8_t *result = NULL, *sealed = NULL;
+    size_t sealed_len = 0;
+    char err[LUNA_BC_ERROR_MAX];
+
+    if (!am || !psize) {
+        if (psize)
+            *psize = 0;
+        return NULL;
+    }
+    *psize = 0;
+    err[0] = '\0';
+    if (luna_bc_pack_begin(am, kdf_shift, &hdr, dk, err, sizeof(err)) != LUNA_BC_OK) {
+        if (ctx)
+            JS_ThrowInternalError(ctx, "luna bytecode: %s", err);
+        return NULL;
+    }
+
+    permuted = (luna_flags & LUNA_BC_FLAG_PERMUTED) != 0;
+
+    memset(s, 0, sizeof(*s));
+    s->ctx = ctx;
+    /* XXX: byte swapped output is untested */
+    s->byte_swap = ((flags & JS_WRITE_OBJ_BSWAP) != 0);
+    s->allow_bytecode = ((flags & JS_WRITE_OBJ_BYTECODE) != 0);
+    s->allow_sab = ((flags & JS_WRITE_OBJ_SAB) != 0);
+    s->allow_reference = ((flags & JS_WRITE_OBJ_REFERENCE) != 0);
+    if (s->allow_bytecode)
+        s->first_atom = JS_ATOM_END;
+    else
+        s->first_atom = 1;
+    if (permuted) {
+        luna_bc_perm_key(dk, s->luna_perm_master);
+        s->luna_func_index = 0;
+        s->luna_perm = &perm;
+    } else {
+        s->luna_perm = NULL;
+    }
+    js_dbuf_init(ctx, &s->dbuf);
+    js_object_list_init(&s->object_list);
+
+    if (JS_WriteObjectRec(s, obj) == 0 && JS_WriteObjectAtoms(s) == 0) {
+        js_object_list_end(ctx, &s->object_list);
+        js_free(ctx, s->atom_to_idx);
+        js_free(ctx, s->idx_to_atom);
+        result = s->dbuf.buf;
+    } else {
+        js_object_list_end(ctx, &s->object_list);
+        js_free(ctx, s->atom_to_idx);
+        js_free(ctx, s->idx_to_atom);
+        dbuf_free(&s->dbuf);
+        result = NULL;
+    }
+    if (!result)
+        goto done;
+    *psize = s->dbuf.size;
+
+    if (permuted)
+        hdr.flags |= LUNA_BC_FLAG_PERMUTED;
+    hdr.flags |= (uint8_t)(luna_flags & (LUNA_BC_FLAG_STRIPPED | LUNA_BC_FLAG_DEVICE_BOUND));
+    if (luna_bc_pack_finish(am, &hdr, dk, result, *psize, &sealed, &sealed_len,
+                            err, sizeof(err)) != LUNA_BC_OK) {
+        js_free(ctx, result);
+        if (ctx)
+            JS_ThrowInternalError(ctx, "luna bytecode: %s", err);
+        *psize = 0;
+        result = NULL;
+        goto done;
+    }
+    js_free(ctx, result);
+    result = sealed;
+    *psize = sealed_len;
+
+ done:
+    luna_bc_wipe(dk, sizeof(dk));
+    luna_bc_wipe(s->luna_perm_master, sizeof(s->luna_perm_master));
+    if (permuted)
+        luna_bc_perm_wipe(&perm);
+    memset(&perm, 0, sizeof(perm));
+    return result;
+}
+
+JSValue JS_ReadObjectLuna(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags,
+                          const LunaAntiModData *am, char *err_msg, size_t err_msg_cap)
+{
+    LunaBCHeader hdr;
+    LunaBCPerm perm;
+    int permuted;
+    uint8_t dk[LUNA_BC_DK_LEN];
+    uint8_t *plain = NULL;
+    size_t plain_len = 0;
+    BCReaderState ss, *s = &ss;
+    JSValue obj;
+    char err[LUNA_BC_ERROR_MAX];
+    int rc;
+
+    err[0] = '\0';
+    rc = luna_bc_unpack_begin(buf, buf_len, am, &hdr, dk, err, sizeof(err));
+    if (rc != LUNA_BC_OK)
+        goto fail;
+    if (luna_bc_unpack_finish(buf, buf_len, &hdr, dk, &plain, &plain_len,
+                              err, sizeof(err)) != LUNA_BC_OK)
+        goto fail;
+
+    permuted = (hdr.flags & LUNA_BC_FLAG_PERMUTED) != 0;
+    memset(s, 0, sizeof(*s));
+    s->ctx = ctx;
+    s->buf_start = plain;
+    s->buf_end = plain + plain_len;
+    s->ptr = plain;
+    s->allow_bytecode = ((flags & JS_READ_OBJ_BYTECODE) != 0);
+    s->is_rom_data = FALSE;
+    s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
+    s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
+    if (s->allow_bytecode)
+        s->first_atom = JS_ATOM_END;
+    else
+        s->first_atom = 1;
+    if (permuted) {
+        luna_bc_perm_key(dk, s->luna_perm_master);
+        s->luna_func_index = 0;
+        s->luna_unperm = &perm;
+    } else {
+        s->luna_unperm = NULL;
+    }
+    luna_bc_wipe(dk, sizeof(dk));
+
+    if (JS_ReadObjectAtoms(s)) {
+        obj = JS_EXCEPTION;
+    } else {
+        obj = JS_ReadObjectRec(s);
+    }
+    bc_reader_free(s);
+    js_free(ctx, plain);
+    luna_bc_wipe(s->luna_perm_master, sizeof(s->luna_perm_master));
+    if (permuted)
+        luna_bc_perm_wipe(&perm);
+    memset(&perm, 0, sizeof(perm));
+    return obj;
+
+ fail:
+    luna_bc_wipe(dk, sizeof(dk));
+    if (err_msg && err_msg_cap) {
+        snprintf(err_msg, err_msg_cap, "%s", err[0] ? err : "unknown error");
+    }
+    if (ctx && err[0])
+        JS_ThrowInternalError(ctx, "luna bytecode: %s", err);
+    return JS_EXCEPTION;
+}
+
+/* Luna: resolve the exports namespace of a module object (BC_TAG_MODULE). */
+JSValue JS_GetModuleNamespace(JSContext *ctx, JSValueConst obj)
+{
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_MODULE)
+        return JS_UNDEFINED;
+    return js_get_module_ns(ctx, JS_VALUE_GET_PTR(obj));
 }
 
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,

@@ -38,6 +38,8 @@ quickjs_h = configure_file(
 
 headers = [
   quickjs_h,
+  files('luna_bc.h'),
+  files('luna_mods.h'),
 ]
 
 sources = [
@@ -46,6 +48,8 @@ sources = [
   'libunicode.c',
   'cutils.c',
   'libbf.c',
+  'luna_bc.c',
+  'luna_mods.c',
 ]
 
 cdata = configuration_data()

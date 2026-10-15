@@ -34,7 +34,11 @@
 #endif
 
 #include "cutils.h"
+#include <dirent.h>
+#include <stdio.h>
 #include "quickjs-libc.h"
+#include "luna_bc.h"
+#include <errno.h>
 
 typedef struct {
     char *name;
@@ -226,6 +230,203 @@ static void find_unique_cname(char *cname, size_t cname_size)
     pstrcpy(cname, cname_size, cname1);
 }
 
+/*
+ * Luna: resolve mod package specifiers ("com.luna.mods.core") against the
+ * directories listed in LUNA_MOD_PATHS, so a whole mod set compiles together
+ * the same way it loads at runtime.
+ */
+/*
+ * Luna: resolve mod package specifiers ("com.luna.mods.core") against the
+ * directories listed in LUNA_MOD_PATHS, so a whole mod set compiles together
+ * exactly the way it loads at runtime. Plain stdio only: no engine state.
+ */
+/* join two path components into a fixed buffer */
+static int luna_join(char *out, size_t cap, const char *a, const char *b)
+{
+    int n = snprintf(out, cap, "%s/%s", a, b);
+
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+static int luna_readable(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+static int luna_str_endswith(const char *s, const char *suffix)
+{
+    size_t ls = strlen(s), lx = strlen(suffix);
+
+    return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
+}
+
+/* pull "entrypoint" out of a manifest.json */
+static void luna_manifest_entry(const char *manifest, char *out, size_t out_cap)
+{
+    const char *key = strstr(manifest, "\"entrypoint\"");
+
+    out[0] = '\0';
+    if (!key)
+        return;
+    {
+        const char *q = strchr(key + 12, '"');
+        const char *r = q ? strchr(q + 1, '"') : NULL;
+
+        if (q && r) {
+            size_t n = (size_t)(r - q - 1);
+
+            if (n >= out_cap)
+                n = out_cap - 1;
+            memcpy(out, q + 1, n);
+            out[n] = '\0';
+        }
+    }
+}
+
+static int luna_manifest_matches(const char *manifest_path, const char *pkg)
+{
+    FILE *f = fopen(manifest_path, "rb");
+    char text[4096], needle[300];
+    size_t n;
+    int found = 0;
+
+    if (!f)
+        return 0;
+    n = fread(text, 1, sizeof(text) - 1, f);
+    text[n] = '\0';
+    fclose(f);
+    snprintf(needle, sizeof(needle), "\"%s\"", pkg);
+    /* the package name is the first string field in a well formed manifest */
+    {
+        const char *key = strstr(text, "\"name\"");
+
+        if (key) {
+            const char *q = strchr(key + 6, '"');
+            const char *r = q ? strchr(q + 1, '"') : NULL;
+
+            if (q && r && (size_t)(r - q - 1) == strlen(pkg) &&
+                strncmp(q + 1, pkg, strlen(pkg)) == 0)
+                found = 1;
+        }
+        (void)needle;
+    }
+    return found;
+}
+
+/*
+ * Find the source of a mod package by package name: every sub directory of
+ * every LUNA_MOD_PATHS entry is inspected through its manifest, so directory
+ * names do not have to repeat the package name.
+ */
+static int luna_resolve_mod_source(const char *pkg, char *out, size_t out_cap)
+{
+    static const char *candidates[] = { "main.js", "index.js", "mod.js", NULL };
+    const char *paths = getenv("LUNA_MOD_PATHS");
+    const char *p = paths;
+
+    if (!paths)
+        return -1;
+    while (*p) {
+        const char *end = strchr(p, ':');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char root[512];
+        DIR *d;
+        struct dirent *de;
+
+        if (len >= sizeof(root))
+            len = sizeof(root) - 1;
+        memcpy(root, p, len);
+        root[len] = '\0';
+        d = opendir(root);
+        if (d) {
+            while ((de = readdir(d)) != NULL) {
+                char mod_dir[1024], manifest[1024], entry[256];
+
+                if (de->d_name[0] == '.')
+                    continue;
+                if (luna_join(mod_dir, sizeof(mod_dir), root, de->d_name) != 0)
+                    continue;
+                if (luna_join(manifest, sizeof(manifest), mod_dir, "manifest.json") != 0)
+                    continue;
+                if (getenv("LUNA_DEBUG"))
+                    fprintf(stderr, "[luna]   try '%s' manifest='%s' readable=%d match=%d\n",
+                            mod_dir, manifest, luna_readable(manifest),
+                            luna_readable(manifest) ? luna_manifest_matches(manifest, pkg) : -1);
+                if (!luna_readable(manifest))
+                    continue;
+                if (!luna_manifest_matches(manifest, pkg))
+                    continue;
+                {
+                    FILE *f = fopen(manifest, "rb");
+                    char text[4096];
+                    size_t n;
+
+                    if (!f)
+                        continue;
+                    n = fread(text, 1, sizeof(text) - 1, f);
+                    text[n] = '\0';
+                    fclose(f);
+                    luna_manifest_entry(text, entry, sizeof(entry));
+                    if (entry[0] && luna_str_endswith(entry, ".luna")) {
+                        size_t el = strlen(entry);
+
+                        entry[el - 5] = '\0';
+                        strcat(entry, ".js");
+                    }
+                    if (entry[0]) {
+                        char try_path[1024], base_dir[1024];
+                        int i;
+
+                        if (luna_join(base_dir, sizeof(base_dir), root, de->d_name) != 0)
+                            continue;
+
+                        if (luna_join(try_path, sizeof(try_path), base_dir, entry) == 0 &&
+                            luna_readable(try_path)) {
+                            snprintf(out, out_cap, "%s", try_path);
+                            closedir(d);
+                            return 0;
+                        }
+                        for (i = 0; candidates[i]; i++) {
+                            if (luna_join(try_path, sizeof(try_path), base_dir, candidates[i]) == 0 &&
+                                luna_readable(try_path)) {
+                                snprintf(out, out_cap, "%s", try_path);
+                                closedir(d);
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+            closedir(d);
+        }
+        if (!end)
+            break;
+        p = end + 1;
+    }
+    return -1;
+}
+
+static int luna_resolve_ok(const char *name)
+{
+    const char *p;
+
+    if (!name || !*name)
+        return 0;
+    if (name[0] == '.' || name[0] == '/')
+        return 0;
+    for (p = name; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-'))
+            return 0;
+    }
+    return getenv("LUNA_MOD_PATHS") != NULL;
+}
+
 JSModuleDef *jsc_module_loader(JSContext *ctx,
                               const char *module_name, void *opaque)
 {
@@ -251,8 +452,24 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
         uint8_t *buf;
         JSValue func_val;
         char cname[1024];
-        
+
         buf = js_load_file(ctx, &buf_len, module_name);
+        if (getenv("LUNA_DEBUG"))
+            fprintf(stderr, "[luna] load '%s' buf=%p ok=%d paths=%s\n", module_name,
+                    (void *)buf, luna_resolve_ok(module_name),
+                    getenv("LUNA_MOD_PATHS") ? getenv("LUNA_MOD_PATHS") : "(null)");
+        if (!buf && luna_resolve_ok(module_name)) {
+            /* a mod package specifier: resolve it against the mod search path */
+            char resolved[1024];
+
+            if (luna_resolve_mod_source(module_name, resolved, sizeof(resolved)) == 0) {
+                if (getenv("LUNA_DEBUG"))
+                    fprintf(stderr, "[luna] resolved '%s' -> '%s'\n", module_name, resolved);
+                buf = js_load_file(ctx, &buf_len, resolved);
+            } else if (getenv("LUNA_DEBUG")) {
+                fprintf(stderr, "[luna] unresolved '%s'\n", module_name);
+            }
+        }
         if (!buf) {
             JS_ThrowReferenceError(ctx, "could not load module filename '%s'",
                                    module_name);
@@ -478,7 +695,73 @@ typedef enum {
     OUTPUT_C,
     OUTPUT_C_MAIN,
     OUTPUT_EXECUTABLE,
+    OUTPUT_LUNA,
 } OutputTypeEnum;
+
+/* NBS container output: the mod is sealed with a key derived from the
+ * anti-mod data supplied by the build environment. */
+static const char *luna_antimod_file;
+static uint32_t luna_kdf_shift = LUNA_BC_KDF_SHIFT_DEFAULT;
+static int luna_flags = LUNA_BC_FLAG_PERMUTED | LUNA_BC_FLAG_STRIPPED;
+
+static int nbs_json_field(const char *json, const char *key, char *out, size_t out_cap)
+{
+    const char *p, *q;
+    size_t klen = strlen(key), n;
+
+    p = strstr(json, key);
+    if (!p)
+        return -1;
+    p += klen;
+    while (*p == ' ' || *p == '\t' || *p == ':')
+        p++;
+    if (*p != '"')
+        return -1;
+    p++;
+    q = strchr(p, '"');
+    if (!q)
+        return -1;
+    n = (size_t)(q - p);
+    if (n >= out_cap)
+        n = out_cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 0;
+}
+
+static LunaAntiModData nbs_load_antimod(void)
+{
+    LunaAntiModData am;
+    static char package[256], apk_sig[256], sig_scheme[64];
+    static char version_name[256], version_code[64], device_id[256], label[256];
+    uint8_t *buf;
+    size_t len;
+
+    memset(&am, 0, sizeof(am));
+    if (!luna_antimod_file)
+        return am;
+    buf = js_load_file(NULL, &len, luna_antimod_file);
+    if (!buf) {
+        fprintf(stderr, "Could not load anti-mod data '%s'\n", luna_antimod_file);
+        exit(1);
+    }
+    if (nbs_json_field((const char *)buf, "\"package\"", package, sizeof(package)) == 0)
+        am.package = package;
+    if (nbs_json_field((const char *)buf, "\"apk_sig_sha256\"", apk_sig, sizeof(apk_sig)) == 0)
+        am.apk_sig_sha256 = apk_sig;
+    if (nbs_json_field((const char *)buf, "\"sig_scheme\"", sig_scheme, sizeof(sig_scheme)) == 0)
+        am.sig_scheme = sig_scheme;
+    if (nbs_json_field((const char *)buf, "\"version_name\"", version_name, sizeof(version_name)) == 0)
+        am.version_name = version_name;
+    if (nbs_json_field((const char *)buf, "\"version_code\"", version_code, sizeof(version_code)) == 0)
+        am.version_code = version_code;
+    if (nbs_json_field((const char *)buf, "\"device_id\"", device_id, sizeof(device_id)) == 0 && device_id[0])
+        am.device_id = device_id;
+    if (nbs_json_field((const char *)buf, "\"label\"", label, sizeof(label)) == 0)
+        am.label = label;
+    free(buf);
+    return am;
+}
 
 int main(int argc, char **argv)
 {
@@ -513,10 +796,24 @@ int main(int argc, char **argv)
     namelist_add(&cmodule_list, "os", "os", 0);
 
     for(;;) {
-        c = getopt(argc, argv, "ho:cN:f:mxevM:p:S:D:");
+        c = getopt(argc, argv, "ho:cN:f:mxevM:p:S:D:n:A:K:B");
         if (c == -1)
             break;
         switch(c) {
+        case 'n':
+            output_type = OUTPUT_LUNA;
+            out_filename = optarg;
+            break;
+        case 'A':
+            luna_antimod_file = optarg;
+            break;
+        case 'K':
+            luna_kdf_shift = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'B':
+            /* keep the unpermuted opcode stream (debugging only) */
+            luna_flags &= ~LUNA_BC_FLAG_PERMUTED;
+            break;
         case 'h':
             help();
         case 'o':
@@ -654,6 +951,67 @@ int main(int argc, char **argv)
         fprintf(fo, "#include <inttypes.h>\n"
                 "\n"
                 );
+    }
+
+    if (output_type == OUTPUT_LUNA) {
+        LunaAntiModData am;
+        uint8_t *buf;
+        size_t buf_len;
+        JSValue obj;
+        uint8_t *container;
+        size_t container_len;
+        FILE *f;
+        int eval_flags;
+
+        if (!luna_antimod_file) {
+            fprintf(stderr, "-n requires -A <antimod.json>: the container key "
+                            "is bound to the target app signature\n");
+            exit(1);
+        }
+        if (optind >= argc) {
+            fprintf(stderr, "-n requires an input file\n");
+            exit(1);
+        }
+        am = nbs_load_antimod();
+        /* the C emitter already truncated the output path: close it before
+         * writing the container */
+        fclose(fo);
+        fo = NULL;
+        buf = js_load_file(ctx, &buf_len, argv[optind]);
+        if (!buf) {
+            fprintf(stderr, "Could not load '%s'\n", argv[optind]);
+            exit(1);
+        }
+        eval_flags = JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_STRIP | JS_EVAL_TYPE_MODULE;
+        obj = JS_Eval(ctx, (const char *)buf, buf_len, argv[optind], eval_flags);
+        js_free(ctx, buf);
+        if (JS_IsException(obj)) {
+            js_std_dump_error(ctx);
+            exit(1);
+        }
+        container = JS_WriteObjectLuna(ctx, &container_len, obj, JS_WRITE_OBJ_BYTECODE,
+                                      &am, luna_kdf_shift, luna_flags);
+        JS_FreeValue(ctx, obj);
+        if (!container) {
+            js_std_dump_error(ctx);
+            exit(1);
+        }
+        f = fopen(out_filename, "wb");
+        if (!f) {
+            fprintf(stderr, "Could not write '%s': %s\n", out_filename, strerror(errno));
+            exit(1);
+        }
+        if (fwrite(container, 1, container_len, f) != container_len) {
+            fprintf(stderr, "Short write to '%s'\n", out_filename);
+            exit(1);
+        }
+        fclose(f);
+        fprintf(stderr, "lunac: sealed %zu bytes into %s "
+                        "(%u PBKDF2 rounds, %s)\n",
+                container_len, out_filename, 1u << luna_kdf_shift,
+                (luna_flags & LUNA_BC_FLAG_PERMUTED) ? "opcodes permuted" : "raw opcodes");
+        free(container);
+        return 0;
     }
 
     for(i = optind; i < argc; i++) {

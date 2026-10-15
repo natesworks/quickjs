@@ -1,0 +1,16 @@
+*.o
+*.a
+qjs
+qjs32
+qjs32_s
+qjsc
+qjscalc.c
+repl.c
+out.c
+run-test262
+unicode_gen
+quickjs.h
+quickjs.exe
+.obj/
+qjsc
+qjs
